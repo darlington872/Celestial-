@@ -2,7 +2,7 @@ services:
   - type: web
     name: the-omniceleestial
     env: node
-    repo: https://github.com/YourUsername/the-omniceleestial-bot.git
+    repo: https://github.com/darlington872/Celestial-.git
     branch: main
     buildCommand: npm install
     startCommand: npm start
