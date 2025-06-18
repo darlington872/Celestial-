@@ -147,7 +147,7 @@ bot.action('BTN_TAKEOVER', async ctx => {
   ctx.reply(fancy('🎯 Choose session:'), Markup.inlineKeyboard(rows));
 });
 bot.action(/^TO_(.+)$/, async ctx => {
-  ctx.answerCbQuery();
+  ctx.answerCbQuery()
   const code = ctx.match[1], entry = sessionState[code];
   if (!entry) return ctx.reply(fancy('❌ Invalid session.'));
   const sock = entry.sock;
