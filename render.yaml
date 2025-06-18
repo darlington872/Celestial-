@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: the-omniceleestial
+    env: node
+    repo: https://github.com/YourUsername/the-omniceleestial-bot.git
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: NODE_ENV
+        value: production
+      - key: SESSIONS_DIR
+        value: /mnt/sessions
+    diskMounts:
+      - diskName: sessions-disk
+        mountPath: /mnt/sessions
+
+disks:
+  - name: sessions-disk
+    region: oregon
+    sizeGb: 1
